@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 typedef struct {
     int16_t someField[24];
