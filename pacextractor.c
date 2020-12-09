@@ -1,155 +1,206 @@
-#include <fcntl.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
+#include <stddef.h> // size_t
+#include <stdio.h> // fclose, fopen, fprintf, fread, fseek, ftell, fwrite, printf, remove, SEEK_END, SEEK_SET, FILE, stderr
+#include <stdlib.h> // exit, free, malloc, EXIT_FAILURE, EXIT_SUCCESS
+#include <string.h> // strcmp
 
-typedef struct {
-    uint16_t szVersion[24];       // packet struct version
-    uint32_t dwSize;              // the whole packet size
-    uint16_t productName[256];    // product name
-    uint16_t firmwareName[256];   // product version
-    uint32_t partitionCount;      // the number of files that will be downloaded, the file may be an operation
-    uint32_t partitionsListStart; // the offset from the packet file header to the array of PartitionHeader struct buffer
-    uint32_t dwMode;
-    uint32_t dwFlashType;
-    uint32_t dwNandStrategy;
-    uint32_t dwIsNvBackup;
-    uint32_t dwNandPageType;
-    uint16_t szPrdAlias[100];     // product alias
-    uint32_t dwOmaDmProductFlag;
-    uint32_t dwIsOmaDM;
-    uint32_t dwIsPreload;
-    uint32_t dwReserved[200];
-    uint32_t dwMagic;
-    uint16_t wCRC1;
-    uint16_t wCRC2;
-} PacHeader;
+#include "crc16.h"
+#include "pacextractor.h"
 
-typedef struct {
-    uint32_t length;              // size of this struct itself
-    uint16_t partitionName[256];  // file ID,such as FDL,Fdl2,NV and etc.
-    uint16_t fileName[256];       // file name in the packet bin file. It only stores file name
-    uint16_t szFileName[256];     // Reserved now
-    uint32_t partitionSize;       // file size
-    uint32_t nFileFlag;           // if "0", means that it need not a file, and 
-                                  // it is only an operation or a list of operations, such as file ID is "FLASH"
-                                  // if "1", means that it need a file
-    uint32_t nCheckFlag;          // if "1", this file must be downloaded; 
-                                  // if "0", this file can not be downloaded;										
-    uint32_t partitionAddrInPac;  // the offset from the packet file header to this file data
-    uint32_t dwCanOmitFlag;       // if "1", this file can not be downloaded and not check it as "All files" 
-                                  // in download and spupgrade tool.
-    uint32_t dwAddrNum;
-    uint32_t dwAddr[5];
-    uint32_t dwReserved[249];     // Reserved for future, not used now
-} PartitionHeader;
+_Bool debug = 0;
+char namebuf[NAME_LENGTH];
 
-void getString(int16_t* baseString, char* resString, int tlen) {
-    if(*baseString == 0) {
-        *resString = 0;
-        return;
-    }
-    int length = 1;
-    do {
-        *resString = *baseString & 0xff;
-        resString++;
+char* getString(uint16_t* baseString) {
+    int length = 0;
+    while (baseString > 0 && *baseString != 0 && ++length < NAME_LENGTH) {
+        namebuf[length-1] = *baseString & 0xff;
         baseString++;
-        if (++length > tlen)
-            break;
-    } while (*baseString > 0);
-    *resString = 0;
+    }
+    namebuf[length] = '\0';
+    return namebuf;
 }
 
-int main(int argc, char** argv) {
+void checkCRC16(PacHeader* pacHeader, FILE* filestream);
+void printPartHeaderInfo(PartitionHeader* partitionHeader);
+void printPacHeaderInfo(PacHeader* pacHeader);
+
+int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("Usage: pacextractor <firmware name>.pac\n");
+        fprintf(stderr, "Usage: pacextractor [-d] [-c] firmware.pac\n");
+        fprintf(stderr, "\t -d\t enable debug output\n");
+        fprintf(stderr, "\t -c\t compute and verify CRC16\n");
+        exit(EXIT_FAILURE);
+    }
+    char* file = argv[argc - 1];
+    _Bool crc16check = 0;
+
+    if ((argc > 2) && (strcmp(argv[1], "-d") == 0 || strcmp(argv[2], "-d") == 0))
+        debug = 1;
+    if ((argc > 2) && (strcmp(argv[2], "-c") == 0 || strcmp(argv[1], "-c") == 0))
+        crc16check = 1;
+
+    FILE* filestream = fopen(file, "rb");
+    if (filestream == NULL) {
+        fprintf(stderr, "cannot open file %s.\n", file);
         exit(EXIT_FAILURE);
     }
 
-    int fd = open(argv[1], O_RDONLY);
-    if (fd == -1) {
-        printf("file %s not found.\n", argv[1]);
-        exit(EXIT_FAILURE);
-    }
-
-    struct stat st;
-    stat(argv[1], &st);
-    int firmwareSize = st.st_size;
+    fseek(filestream, 0, SEEK_END);
+    int firmwareSize = ftell(filestream);
     if (firmwareSize < sizeof(PacHeader)) {
-        printf("file %s is not a PAC firmware\n", argv[1]);
+        fprintf(stderr, "file %s is not a PAC firmware\n", file);
         exit(EXIT_FAILURE);
     }
 
     PacHeader pacHeader;
-    size_t rb = read(fd, &pacHeader, sizeof(PacHeader));
+    fseek(filestream, 0, SEEK_SET);
+    size_t rb = fread(&pacHeader, 1, sizeof(PacHeader), filestream);
     if (rb <= 0) {
-        printf("Error while parsing PAC header\n");
-        exit(EXIT_FAILURE);
-    } else if (pacHeader.dwSize != firmwareSize) {
-        printf("Size mismatch error. PAC may be damaged.\n");
+        fprintf(stderr, "Error while parsing PAC header\n");
         exit(EXIT_FAILURE);
     }
+    if (pacHeader.dwSize != firmwareSize) {
+        fprintf(stderr, "Size mismatch error. PAC may be damaged.\n");
+        exit(EXIT_FAILURE);
+    } else if (strcmp(getString(pacHeader.szVersion), "BP_R1.0.0") != 0) {
+        fprintf(stderr, "Unsupported PAC version\n");
+        exit(EXIT_FAILURE);
+    }
+    if (debug) printPacHeaderInfo(&pacHeader);
 
-    char buffer1[256];
-    char buffer2[256];
-    getString(pacHeader.firmwareName, buffer1, 256);
-    printf("Product version: %s\n", buffer1);
+    if (crc16check) checkCRC16(&pacHeader, filestream);
 
-    uint32_t curPos = pacHeader.partitionsListStart;
-    PartitionHeader** partHeaders = malloc(sizeof(PartitionHeader**)*pacHeader.partitionCount);
+    PartitionHeader** partHeaders = malloc(sizeof(PartitionHeader**) * pacHeader.partitionCount);
     int i;
+    fseek(filestream, pacHeader.partitionsListStart, SEEK_SET);
     for (i = 0; i < pacHeader.partitionCount; i++) {
-        lseek(fd, curPos, SEEK_SET);
-        size_t length = sizeof(PartitionHeader);
+        size_t length = SIZE_OF_PARTITION_HEADER;
         partHeaders[i] = malloc(length);
-        rb = read(fd, partHeaders[i], length);
+        rb = fread(partHeaders[i], 1, length, filestream);
         if (rb <= 0) {
-            printf("Partition header error\n");
+            fprintf(stderr, "Partition header error\n");
             exit(EXIT_FAILURE);
         }
-        curPos += length;
-
-        getString(partHeaders[i]->partitionName, buffer1, 256);
-        getString(partHeaders[i]->fileName, buffer2, 256);
-        if (partHeaders[i]->partitionSize != 0) {
-            printf("Partition name: %s\n\twith file name: %s\n\twith size %u\n", buffer1, buffer2, partHeaders[i]->partitionSize);
+        if (partHeaders[i]->length != SIZE_OF_PARTITION_HEADER) {
+            fprintf(stderr, "Unknown Partition Header format found\n");
+            exit(EXIT_FAILURE);
         }
+        if (debug) printPartHeaderInfo(partHeaders[i]);
     }
 
-    printf("\nExtracting...\n");
+    printf("\nExtracting...\n\n");
+    char fiveSpaces[] = "    ";
+    char filebuf[4096];
     for (i = 0; i < pacHeader.partitionCount; i++) {
         if (partHeaders[i]->partitionSize == 0) {
             free(partHeaders[i]);
             continue;
         }
-        lseek(fd, partHeaders[i]->partitionAddrInPac, SEEK_SET);
-        getString(partHeaders[i]->fileName, buffer1, 256);
-        remove(buffer1);
-        int fd_new = open(buffer1, O_WRONLY|O_CREAT, 0666);
-        printf("\t%s", buffer1);
+        fseek(filestream, partHeaders[i]->partitionAddrInPac, SEEK_SET);
+        char* partFile = getString(partHeaders[i]->fileName);
+        remove(partFile);
+        FILE* newstream = fopen(partFile, "wb");
+        printf("%s%s", fiveSpaces, partFile);
         uint32_t dataSizeLeft = partHeaders[i]->partitionSize;
         while (dataSizeLeft > 0) {
-            uint32_t copyLength = (dataSizeLeft > 256) ? 256 : dataSizeLeft;
-            rb = read(fd, buffer1, copyLength);
+            uint32_t copyLength = (dataSizeLeft > 4096) ? 4096 : dataSizeLeft;
+            rb = fread(filebuf, 1, copyLength, filestream);
             if (rb != copyLength) {
-                printf("\nPartition image extraction error\n");
+                fprintf(stderr, "\nPartition image extraction error\n");
                 exit(EXIT_FAILURE);
             }
             dataSizeLeft -= copyLength;
-            rb = write(fd_new, buffer1, copyLength);
+            rb = fwrite(filebuf, 1, copyLength, newstream);
             if (rb != copyLength) {
-                printf("\nPartition image extraction error\n");
+                fprintf(stderr, "\nPartition image extraction error\n");
                 exit(EXIT_FAILURE);
             }
-            printf("\r%d%%", 100 - 100*dataSizeLeft/partHeaders[i]->partitionSize);
+            printf("\r%d%%", 100 - ((100 * dataSizeLeft) / partHeaders[i]->partitionSize));
         }
-        printf("\n");
-        close(fd_new);
+        printf("\r%s%s\n", partFile, fiveSpaces);
+        fclose(newstream);
         free(partHeaders[i]);
     }
+    printf("\nDone...\n");
     free(partHeaders);
-    close(fd);
+    fclose(filestream);
 
     return EXIT_SUCCESS;
+}
+
+void checkCRC16(PacHeader* pacHeader, FILE* filestream) {
+    size_t rb;
+    if (pacHeader->dwMagic == (uint32_t) PAC_MAGIC) {
+        printf("Checking CRC Part 1\n");
+        fseek(filestream, 0, SEEK_SET);
+        unsigned char buffer[SIZE_OF_PAC_HEADER - 4];
+        rb = fread(buffer, 1, SIZE_OF_PAC_HEADER - 4, filestream);
+        if (rb != (SIZE_OF_PAC_HEADER - 4)) {
+            fprintf(stderr, "Partition header error\n");
+            exit(EXIT_FAILURE);
+        }
+        uint16_t crc1 = crc16(0, buffer, SIZE_OF_PAC_HEADER - 4);
+        uint16_t crc1InPac = pacHeader->wCRC1;
+        if (debug) printf("Computed CRC1 = %d, CRC1 in PAC = %d\n", crc1, crc1InPac);
+        if (crc1 != crc1InPac) {
+            fprintf(stderr, "CRC Check failed for CRC1\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    printf("Checking CRC Part 2\n");
+    int BUF_SIZE = 64 * 1024;
+    unsigned char buffer[BUF_SIZE];
+    fseek(filestream, SIZE_OF_PAC_HEADER, SEEK_SET);
+    uint16_t crc2 = 0;
+    uint32_t dataSizeLeft = pacHeader->dwSize - SIZE_OF_PAC_HEADER;
+    while (dataSizeLeft > 0) {
+        uint32_t copyLength = (dataSizeLeft > BUF_SIZE) ? BUF_SIZE : dataSizeLeft;
+        rb = fread(buffer, 1, copyLength, filestream);
+        if (rb != copyLength) {
+            fprintf(stderr, "\nPartition image extraction error\n");
+            exit(EXIT_FAILURE);
+        }
+        dataSizeLeft -= copyLength;
+        crc2 = crc16(crc2, buffer, copyLength);
+    }
+    uint16_t crc2InPac = pacHeader->wCRC2;
+    if (debug) printf("Computed CRC2 = %d, CRC2 in PAC = %d\n\n", crc2, crc2InPac);
+    if (crc2 != crc2InPac) {
+        fprintf(stderr, "CRC Check failed for CRC2\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void printPacHeaderInfo(PacHeader* pacHeader) {
+    printf("Version"    "\t\t= %s"  "\n", getString(pacHeader->szVersion));
+    printf("Size"       "\t\t= %u"  "\n", pacHeader->dwSize);
+    printf("PrdName"    "\t\t= %s"  "\n", getString(pacHeader->productName));
+    printf("FirmwareName" "\t= %s"  "\n", getString(pacHeader->firmwareName));
+    printf("FileCount"    "\t= %d"  "\n", pacHeader->partitionCount);
+    printf("FileOffset"   "\t= %d"  "\n", pacHeader->partitionsListStart);
+    printf("Mode"       "\t\t= %d"  "\n", pacHeader->dwMode);
+    printf("FlashType"    "\t= %d"  "\n", pacHeader->dwFlashType);
+    printf("NandStrategy" "\t= %d"  "\n", pacHeader->dwNandStrategy);
+    printf("IsNvBackup"   "\t= %d"  "\n", pacHeader->dwIsNvBackup);
+    printf("NandPageType" "\t= %d"  "\n", pacHeader->dwNandPageType);
+    printf("PrdAlias"     "\t= %s"  "\n", getString(pacHeader->szPrdAlias));
+    printf("OmaDmPrdFlag" "\t= %d"  "\n", pacHeader->dwOmaDmProductFlag);
+    printf("IsOmaDM"    "\t\t= %d"  "\n", pacHeader->dwIsOmaDM);
+    printf("IsPreload"    "\t= %d"  "\n", pacHeader->dwIsPreload);
+    printf("Magic"     "\t\t= %#x"  "\n", pacHeader->dwMagic);
+    printf("CRC1"       "\t\t= %u"  "\n", pacHeader->wCRC1);
+    printf("CRC2"       "\t\t= %u"  "\n", pacHeader->wCRC2);
+    printf("\n\n");
+}
+
+void printPartHeaderInfo(PartitionHeader* partitionHeader) {
+    printf("Size"      "\t\t= %d" "\n", partitionHeader->length);
+    printf("FileID"    "\t\t= %s" "\n", getString(partitionHeader->partitionName));
+    printf("FileName"    "\t= %s" "\n", getString(partitionHeader->fileName));
+    printf("FileSize"    "\t= %u" "\n", partitionHeader->partitionSize);
+    printf("FileFlag"    "\t= %d" "\n", partitionHeader->nFileFlag);
+    printf("CheckFlag"   "\t= %d" "\n", partitionHeader->nCheckFlag);
+    printf("DataOffset"  "\t= %u" "\n", partitionHeader->partitionAddrInPac);
+    printf("CanOmitFlag" "\t= %d" "\n", partitionHeader->dwCanOmitFlag);
+    printf("\n");
 }
