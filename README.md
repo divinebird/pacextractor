@@ -14,6 +14,9 @@ Download **_PacExtractor.jar_** from [releases](https://github.com/HemanthJabalp
 **Android Users:**  
 `dalvikvm -cp PacExtractor.jar com.sprd.pacextractor.PacExtractor pacfile outdir`  
 
+### Test:
+An example .pac file to extract can be found at [here](https://androidfilehost.com/?fid=674106145207485464)(~8MiB).
+
 ### References are:
 https://github.com/divinebird/pacextractor  
 https://spdflashtool.com/source/spd-tool-source-code  
